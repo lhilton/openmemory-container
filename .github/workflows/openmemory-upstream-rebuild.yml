@@ -1,11 +1,19 @@
 # =============================================================================
-# OpenMemory upstream release tracker + image builder.
+# OpenMemory pinned-commit image builder.
 #
-# Polls CaviraOSS/OpenMemory release tags daily (cron) and on manual dispatch,
-# resolves the latest non-prerelease tag -> commit SHA (TOCTOU defense), builds
-# upstream's own Dockerfiles verbatim (no fork, no source modification), pushes
-# amd64 images to GHCR with cosign keyless signing + SLSA provenance, and commits
-# the processed tag back to .upstream-release.
+# Builds CaviraOSS/OpenMemory's own Dockerfiles verbatim (no fork, no source
+# modification) at a KNOWN-GOOD commit and publishes signed linux/amd64 images
+# to GHCR.
+#
+# The commit to build is pinned in `.upstream-commit`. To update, edit that file
+# to a new commit SHA and push to main — that triggers a build and moves :latest.
+# A manual run with a `ref` input builds an arbitrary commit/branch/tag WITHOUT
+# moving :latest (handy for testing).
+#
+# Why a pinned commit (not a release tag): upstream's tagged releases currently
+# can't build both images — v1.2.3 has no dashboard Dockerfile and v1.3.0 ships
+# no dashboard source. Only main builds backend + dashboard together, so we pin a
+# tested main commit and bump it deliberately.
 #
 # Two images are published:
 #   ghcr.io/lhilton/openmemory            (backend, packages/openmemory-js)
@@ -13,20 +21,19 @@
 #
 # Actions are pinned to SHAs. Dependabot keeps them current (.github/dependabot.yml).
 # =============================================================================
-name: openmemory upstream rebuild
+name: openmemory build
 
 on:
-  schedule:
-    - cron: '17 9 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - '.upstream-commit'
+      - '.github/workflows/openmemory-upstream-rebuild.yml'
   workflow_dispatch:
     inputs:
-      force:
-        description: 'Force a rebuild of the current latest release'
-        required: false
-        type: boolean
-        default: false
-      tag:
-        description: 'Rebuild a specific historical tag (e.g. v1.2.3 or 1.2.1). Will NOT promote :latest or update .upstream-release.'
+      ref:
+        description: 'Upstream ref to build (commit SHA, branch, or tag). Empty = use .upstream-commit. A non-empty value does NOT move :latest.'
         required: false
         type: string
         default: ''
@@ -35,21 +42,20 @@ on:
 permissions: {}
 
 concurrency:
-  group: openmemory-upstream-rebuild-${{ github.ref }}
+  group: openmemory-build-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Job 1: resolve the latest OpenMemory release tag + commit SHA, decide if changed.
+  # Job 1: resolve the upstream ref (pin file or dispatch input) to a commit SHA.
   # ---------------------------------------------------------------------------
   check:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
-      changed: ${{ steps.resolve.outputs.changed }}
-      tag: ${{ steps.resolve.outputs.tag }}
       sha: ${{ steps.resolve.outputs.sha }}
+      short_sha: ${{ steps.resolve.outputs.short_sha }}
       should_promote: ${{ steps.resolve.outputs.should_promote }}
     steps:
       - name: Checkout this repo
@@ -57,13 +63,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Validate input, resolve tag + SHA, compute changed
+      - name: Resolve ref to commit SHA
         id: resolve
-        # inputs.tag is passed via env (injection defense — never interpolate
-        # ${{ inputs.tag }} directly into a bash double-quoted string).
+        # ref input is passed via env (injection defense — never interpolate
+        # ${{ inputs.ref }} directly into a bash double-quoted string).
         env:
-          TAG_INPUT: ${{ inputs.tag }}
-          FORCE_INPUT: ${{ inputs.force }}
+          REF_INPUT: ${{ inputs.ref }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -75,66 +80,43 @@ jobs:
             exit 1
           fi
 
-          # --- Validate tag input format (only if supplied). Accept v/no-v forms. ---
-          if [ -n "$TAG_INPUT" ]; then
-            if [[ ! "$TAG_INPUT" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "::error::Invalid tag format (must match ^v?[0-9]+\.[0-9]+\.[0-9]+\$)"
-              exit 1
-            fi
-          fi
-
-          # --- Resolve the tag to build ---
-          if [ -n "$TAG_INPUT" ]; then
-            TAG="$TAG_INPUT"
+          # Dispatch input wins; otherwise use the pinned commit. A dispatch ref is
+          # an ad-hoc build and must NOT move :latest.
+          if [ -n "$REF_INPUT" ]; then
+            REF="$REF_INPUT"
+            PROMOTE=false
           else
-            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-              -H 'Accept: application/vnd.github+json' \
-              'https://api.github.com/repos/CaviraOSS/OpenMemory/releases?per_page=100' \
-              | jq -r --arg re '^v?[0-9]+\.[0-9]+\.[0-9]+$' '
-                  [.[] | select(.tag_name | test($re)) | select(.prerelease == false) | select(.draft == false)]
-                  | sort_by(.published_at) | reverse | .[0].tag_name')
+            REF="$(tr -d ' \t\r\n' < .upstream-commit)"
+            PROMOTE=true
           fi
-          test -n "$TAG" && [ "$TAG" != "null" ] || { echo "::error::No tag resolved"; exit 1; }
+          test -n "$REF" || { echo "::error::No ref to build (empty .upstream-commit and no input)"; exit 1; }
 
-          # --- Resolve tag -> commit SHA (dereference annotated tags; fail-closed) ---
-          RESP=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-            -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/CaviraOSS/OpenMemory/git/refs/tags/$TAG")
-          TYPE=$(echo "$RESP" | jq -r '.object.type')
-          OBJ_SHA=$(echo "$RESP" | jq -r '.object.sha')
-          if [ "$TYPE" = "tag" ]; then
-            SHA=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-              -H 'Accept: application/vnd.github+json' \
-              "https://api.github.com/repos/CaviraOSS/OpenMemory/git/tags/$OBJ_SHA" \
-              | jq -r '.object.sha')
-            test "$SHA" != "null" || { echo "::error::Could not dereference annotated tag $TAG"; exit 1; }
-          elif [ "$TYPE" = "commit" ]; then
-            SHA="$OBJ_SHA"
-          else
-            echo "::error::Unexpected object type '$TYPE' for tag $TAG"
+          # Allow only safe ref characters (SHA / branch / tag).
+          if [[ ! "$REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Invalid ref '$REF'"
             exit 1
           fi
 
-          # --- Decide if anything changed (or force was requested) ---
-          PINNED=$(cat .upstream-release 2>/dev/null || echo none)
-          if [ "$FORCE_INPUT" = "true" ] || [ -n "$TAG_INPUT" ] || [ "$PINNED" != "$TAG" ]; then
-            CHANGED=true
-          else
-            CHANGED=false
-          fi
-          if [ -z "$TAG_INPUT" ]; then SHOULD_PROMOTE=true; else SHOULD_PROMOTE=false; fi
+          # Resolve REF -> full commit SHA (works for a SHA, branch, or tag).
+          SHA=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/CaviraOSS/OpenMemory/commits/$REF" \
+            | jq -r '.sha')
+          test -n "$SHA" && [ "$SHA" != "null" ] || { echo "::error::Could not resolve ref '$REF' to a commit"; exit 1; }
+          SHORT="${SHA:0:7}"
 
           {
-            echo "tag=$TAG"; echo "sha=$SHA"; echo "changed=$CHANGED"; echo "should_promote=$SHOULD_PROMOTE"
+            echo "sha=$SHA"
+            echo "short_sha=$SHORT"
+            echo "should_promote=$PROMOTE"
           } >> "$GITHUB_OUTPUT"
-          echo "Resolved tag=$TAG sha=$SHA changed=$CHANGED should_promote=$SHOULD_PROMOTE"
+          echo "Resolved ref=$REF sha=$SHA should_promote=$PROMOTE"
 
   # ---------------------------------------------------------------------------
-  # Job 2: build both images in a matrix. Only runs if something changed.
+  # Job 2: build both images in a matrix.
   # ---------------------------------------------------------------------------
   build:
     needs: check
-    if: needs.check.outputs.changed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -154,7 +136,8 @@ jobs:
             context: dashboard
             dockerfile: dashboard/Dockerfile
             # Empty NEXT_PUBLIC_* => client uses the same-origin runtime proxy
-            # (route.ts reads OPENMEMORY_API_URL at runtime). Keeps image portable.
+            # (app/api/openmemory/[...path]/route.ts reads OPENMEMORY_API_URL at
+            # runtime). Keeps the prebuilt image portable — no build-time URL baking.
             build-args: |
               NEXT_PUBLIC_API_URL=
               NEXT_PUBLIC_API_KEY=
@@ -175,7 +158,7 @@ jobs:
           cd openmemory
           ACTUAL_SHA=$(git rev-parse HEAD)
           test "$ACTUAL_SHA" = "$EXPECTED_SHA" || {
-            echo "::error::SHA mismatch — tag may have moved (expected $EXPECTED_SHA, got $ACTUAL_SHA)"
+            echo "::error::SHA mismatch (expected $EXPECTED_SHA, got $ACTUAL_SHA)"
             exit 1
           }
 
@@ -184,11 +167,9 @@ jobs:
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ghcr.io/lhilton/${{ matrix.image }}
-          # Dual semver patterns publish BOTH 1.2.3 and v1.2.3 for every release,
-          # regardless of upstream's v/no-v prefix (tag-consistency fix).
+          # Immutable tags only; :latest is promoted after verification below.
           tags: |
-            type=semver,pattern={{version}},value=${{ needs.check.outputs.tag }}
-            type=semver,pattern=v{{version}},value=${{ needs.check.outputs.tag }}
+            type=raw,value=${{ needs.check.outputs.short_sha }}
             type=raw,value=openmemory-${{ needs.check.outputs.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/CaviraOSS/OpenMemory
@@ -219,8 +200,8 @@ jobs:
           sbom: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.image }}-${{ needs.check.outputs.tag }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ needs.check.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
       - name: Generate SLSA provenance attestation
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
@@ -262,65 +243,26 @@ jobs:
         with:
           version: v0.21.7
 
-      - name: Promote mutable tags
+      - name: Promote :latest (only for pinned builds, after verification)
         if: ${{ needs.check.outputs.should_promote == 'true' }}
         env:
           IMAGE_REPO: ghcr.io/lhilton/${{ matrix.image }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-          UPSTREAM_TAG: ${{ needs.check.outputs.tag }}
           CERTIFICATE_IDENTITY: https://github.com/lhilton/openmemory-container/.github/workflows/openmemory-upstream-rebuild.yml@refs/heads/main
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          VERSION="${UPSTREAM_TAG#v}"          # strip leading v if present
-          MAJOR="${VERSION%%.*}"
-          MINOR_PATCH="${VERSION#*.}"
-          MINOR="${MINOR_PATCH%%.*}"
-          PROMOTE_TAGS=("latest" "${MAJOR}.${MINOR}" "$MAJOR")
-          for tag in "${PROMOTE_TAGS[@]}"; do
-            ref="${IMAGE_REPO}:${tag}"
-            crane tag "${IMAGE_REPO}@${IMAGE_DIGEST}" "$tag"
-            promoted_digest=$(crane digest "$ref")
-            if [ "$promoted_digest" != "$IMAGE_DIGEST" ]; then
-              echo "::error::Promoted $ref points to $promoted_digest, expected $IMAGE_DIGEST"; exit 1
-            fi
-            cosign verify "$ref" \
-              --certificate-identity "$CERTIFICATE_IDENTITY" \
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com
-          done
+          ref="${IMAGE_REPO}:latest"
+          crane tag "${IMAGE_REPO}@${IMAGE_DIGEST}" latest
+          promoted_digest=$(crane digest "$ref")
+          if [ "$promoted_digest" != "$IMAGE_DIGEST" ]; then
+            echo "::error::Promoted $ref points to $promoted_digest, expected $IMAGE_DIGEST"; exit 1
+          fi
+          cosign verify "$ref" \
+            --certificate-identity "$CERTIFICATE_IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
           gh attestation verify "oci://${IMAGE_REPO}@${IMAGE_DIGEST}" \
             --repo lhilton/openmemory-container \
             --bundle-from-oci \
             --cert-identity "$CERTIFICATE_IDENTITY" \
             --cert-oidc-issuer https://token.actions.githubusercontent.com
-
-  # ---------------------------------------------------------------------------
-  # Job 3: commit the processed tag back to .upstream-release.
-  # Skipped for manual tag dispatches (preserves cron's no-op detection).
-  # ---------------------------------------------------------------------------
-  commit-pin:
-    needs: [check, build]
-    if: needs.check.outputs.changed == 'true' && needs.check.outputs.should_promote == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout this repo
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: true
-      - name: Commit and push .upstream-release
-        env:
-          TAG: ${{ needs.check.outputs.tag }}
-          SHA: ${{ needs.check.outputs.sha }}
-          BRANCH: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          git config user.name  'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-          echo "$TAG" > .upstream-release
-          git add .upstream-release
-          if git diff --cached --quiet; then echo "no change to commit"; exit 0; fi
-          git commit -m "chore(upstream): OpenMemory @ $TAG ($SHA)"
-          git fetch origin "$BRANCH"
-          git push origin HEAD:"$BRANCH"

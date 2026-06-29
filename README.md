@@ -4,14 +4,19 @@ Pre-built, automatically updated **amd64** Docker images for
 [OpenMemory](https://github.com/CaviraOSS/OpenMemory)'s **backend** API and **dashboard** web UI,
 published to GitHub Container Registry with cosign signatures and SLSA provenance.
 
-OpenMemory ships Dockerfiles but does not publish container images. This repo tracks OpenMemory's
-release tags, builds the upstream Dockerfiles verbatim (no fork, no source changes), and publishes
+OpenMemory ships Dockerfiles but does not publish container images. This repo builds the upstream
+Dockerfiles verbatim (no fork, no source changes) at a **pinned, tested commit** and publishes
 ready-to-pull images for `linux/amd64`:
 
 | Image | Purpose |
 |---|---|
 | `ghcr.io/lhilton/openmemory` | Backend API + MCP server (`:8080`) |
 | `ghcr.io/lhilton/openmemory-dashboard` | Next.js web UI (`:3000`) |
+
+> **Why a pinned commit instead of a release tag?** Upstream's current tagged releases can't build
+> both images — `v1.2.3` has no dashboard Dockerfile and the `v1.3.0` prerelease ships no dashboard
+> source. Only the `main` branch builds the backend **and** dashboard together, so this repo pins a
+> known-good `main` commit (in [`.upstream-commit`](.upstream-commit)) and bumps it deliberately.
 
 > **Architecture:** images are built **amd64-only** (e.g. AMD Ryzen / Intel hosts). There is no arm64
 > build. The backend's `sqlite3` native module and Postgres `pgvector` paths are exercised on amd64.
@@ -103,22 +108,17 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
 ## Available image tags
 
-Each tracking build publishes immutable tags first, then promotes mutable channel tags to the same
-digest after signing + attestation verification.
-
-Example for upstream release `v1.2.3`:
+Each build publishes immutable commit-SHA tags first, then promotes `:latest` to the same digest after
+signing + attestation verification.
 
 | Tag | Meaning |
 |---|---|
-| `:1.2.3` | Exact upstream release (normalized, no `v`) |
-| `:v1.2.3` | Exact upstream release (`v`-prefixed alias) |
-| `:openmemory-<sha>` | Exact upstream commit SHA |
-| `:latest` | Mutable latest verified tracking build |
-| `:1.2` | Mutable major.minor channel |
-| `:1` | Mutable major channel |
+| `:openmemory-<full-sha>` | Exact upstream commit (immutable) |
+| `:<short-sha>` | Exact upstream commit, 7-char short form (immutable) |
+| `:latest` | The currently pinned, verified build (mutable) |
 
-Manual historical rebuilds (`tag: vX.Y.Z` dispatch) publish only the exact tags and never move
-`:latest`, `:X.Y`, `:X`, nor update `.upstream-release`.
+Ad-hoc builds via `workflow_dispatch` with a `ref` input publish only the two immutable SHA tags and
+never move `:latest`.
 
 ## Verifying images
 
@@ -136,31 +136,32 @@ Replace `openmemory` with `openmemory-dashboard` to verify the dashboard image.
 
 ## How images are published
 
-The workflow (`.github/workflows/openmemory-upstream-rebuild.yml`) runs daily at 09:17 UTC and can be
-run manually from GitHub Actions. It:
+The workflow (`.github/workflows/openmemory-upstream-rebuild.yml`) builds the commit pinned in
+[`.upstream-commit`](.upstream-commit). It:
 
-1. Resolves the latest non-prerelease OpenMemory release tag (accepts both `vX.Y.Z` and `X.Y.Z` forms),
-   or validates a manual `tag`.
-2. Resolves the tag to a commit SHA (TOCTOU-defended) and checks whether a build is needed.
-3. Builds `openmemory` (from `packages/openmemory-js`) and `openmemory-dashboard` (from `dashboard`) at
+1. Resolves the pinned ref (or a `workflow_dispatch` `ref` input) to a full commit SHA.
+2. Builds `openmemory` (from `packages/openmemory-js`) and `openmemory-dashboard` (from `dashboard`) at
    that SHA, for `linux/amd64`.
-4. Pushes immutable tags, signs the digest (cosign keyless), attests SLSA provenance, and verifies both.
-5. Promotes mutable tags only for normal tracking builds.
-6. Updates `.upstream-release` only for normal tracking builds.
+3. Pushes immutable SHA tags, signs the digest (cosign keyless), attests SLSA provenance, verifies both.
+4. Promotes `:latest` to the verified digest — only for pinned builds (not ad-hoc `ref` dispatches).
 
-Manual dispatch options:
+**To update the pinned version**, edit `.upstream-commit` to a new commit SHA and push to `main`:
 
-- `force: true` — rebuild the current latest release and re-promote mutable tags.
-- `tag: vX.Y.Z` — rebuild a specific historical release; never promotes mutable tags.
+```bash
+echo <new-commit-sha> > .upstream-commit
+git commit -am "bump: OpenMemory <new-commit-sha>" && git push
+```
+
+The push triggers a build and moves `:latest`. To test an arbitrary commit/branch/tag without moving
+`:latest`, run it manually:
+
+```bash
+gh workflow run openmemory-upstream-rebuild.yml --repo lhilton/openmemory-container -f ref=<sha-or-branch>
+gh run watch --repo lhilton/openmemory-container
+```
 
 The workflow only publishes from `refs/heads/main`, matching the strict OIDC identity used for
 verification.
-
-```bash
-# Trigger a build without waiting for the daily cron:
-gh workflow run openmemory-upstream-rebuild.yml --repo lhilton/openmemory-container
-gh run watch --repo lhilton/openmemory-container
-```
 
 ## Attribution
 
