@@ -23,6 +23,11 @@ least-privilege app role, the extension, and the fixed-dimension vector table by
 docker exec -i postgres18 psql -v ON_ERROR_STOP=1 -U postgres < postgres-init.sql
 ```
 
+> **Using a GUI client (DBeaver/pgAdmin/TablePlus) instead of `psql`?** GUI clients don't understand the
+> `\connect` line. Run **PART 1** connected to the `postgres` database, then **reconnect your client to the
+> `openmemory` database** and run **PART 2**. The `vector` extension and table are per-database, so PART 2
+> must run while connected to `openmemory`.
+
 Why the SQL: OpenMemory otherwise creates an unbounded `vector` column and then fails building an HNSW
 index on it (upstream bug). Pre-creating the table at `vector(1536)` lets its idempotent
 schema/index creation succeed. `1536` matches the default `synthetic` and OpenAI embeddings.
