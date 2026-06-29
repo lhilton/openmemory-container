@@ -1,15 +1,17 @@
 # =============================================================================
 # Sample deployment for OpenMemory using the auto-built GHCR images.
 #
-# Default backend is PostgreSQL (pgvector). The OpenMemory backend self-creates
-# its database, the `vector` extension, all tables, and an HNSW index on first
-# boot — there are NO init scripts and NO migration step.
+# Default backend is PostgreSQL (pgvector). The init script in ./init pre-creates
+# the vector table with a fixed dimension (a workaround for an upstream bug — see
+# init/01-openmemory-vectors.sql); OpenMemory then creates the rest of its schema
+# (tables + HNSW index) itself on first boot. No migration step.
 #
 # Quickstart:
-#   cp .env.example .env        # then set OM_PG_PASSWORD
+#   cp .env.example .env        # then set OM_PG_PASSWORD and OM_API_KEY
 #   docker compose -f docker-compose.sample.yaml up -d
-#   curl http://localhost:8080/health      # backend
-#   open  http://localhost:3000            # dashboard
+#   curl http://localhost:8080/health                          # backend (public)
+#   curl -H "x-api-key: $OM_API_KEY" http://localhost:8080/memory/all   # API needs the key
+#   open  http://localhost:3000                                # dashboard
 #
 # For a zero-dependency SQLite deployment instead, see the README ("SQLite mode").
 # =============================================================================
@@ -23,6 +25,9 @@ services:
       POSTGRES_DB: ${OM_PG_DB:-openmemory}
     volumes:
       - openmemory_pg:/var/lib/postgresql/data
+      # Runs once on a fresh data volume: creates the pgvector extension and the
+      # vector table with a fixed dimension so OpenMemory's HNSW index can build.
+      - ./init/01-openmemory-vectors.sql:/docker-entrypoint-initdb.d/01-openmemory-vectors.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -q -U ${OM_PG_USER:-openmemory} -d ${OM_PG_DB:-openmemory}"]
       interval: 5s
@@ -44,9 +49,14 @@ services:
       OM_PG_USER: ${OM_PG_USER:-openmemory}
       OM_PG_PASSWORD: ${OM_PG_PASSWORD:?Set OM_PG_PASSWORD in .env}
       OM_PG_SSL: disable
-      OM_API_KEY: ${OM_API_KEY:-}           # empty = no auth (fine for first run)
-      # Embeddings default to 'synthetic' (no external calls, no key needed).
-      # For real embeddings, set OM_EMBEDDINGS=openai and OPENAI_API_KEY in .env.
+      # Required: the API rejects protected endpoints with 503 unless OM_API_KEY is
+      # set. Pass it as the `x-api-key` header on requests. (To run with no auth in a
+      # trusted LAN instead, drop this and set OM_DEV_ALLOW_NO_AUTH: "true".)
+      OM_API_KEY: ${OM_API_KEY:?Set OM_API_KEY in .env}
+      # Embeddings default to 'synthetic' (no external calls, no key needed), 1536-dim
+      # — which matches init/01-openmemory-vectors.sql. For real embeddings, set
+      # OM_EMBEDDINGS=openai and OPENAI_API_KEY in .env (keep the dim at 1536, or
+      # update the init script and reset the postgres volume).
     volumes:
       - openmemory_data:/data               # harmless in PG mode; holds any on-disk state
     depends_on:

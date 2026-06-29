@@ -26,7 +26,7 @@ ready-to-pull images for `linux/amd64`:
 ```bash
 git clone https://github.com/lhilton/openmemory-container.git
 cd openmemory-container
-cp .env.example .env          # then edit OM_PG_PASSWORD
+cp .env.example .env          # set OM_PG_PASSWORD and OM_API_KEY (openssl rand -hex 32)
 docker compose -f docker-compose.sample.yaml up -d
 ```
 
@@ -34,15 +34,33 @@ Once healthy:
 
 | Service | URL |
 |---|---|
-| Backend API | http://localhost:8080 (health: `/health`) |
+| Backend API | http://localhost:8080 (health: `/health`, public) |
 | Dashboard | http://localhost:3000 |
 
-The OpenMemory backend **self-initializes** Postgres on first boot: it connects, creates the database
-if missing, runs `CREATE EXTENSION IF NOT EXISTS vector`, creates all tables, and builds an HNSW index
-for fast vector search. There are **no init scripts and no migration step**. Because of the `vector`
-extension, the sample uses the `pgvector/pgvector:pg17` image — a plain `postgres` image will not work.
+Vectors and metadata both live in the same Postgres database (`OM_METADATA_BACKEND=postgres`), using the
+`pgvector/pgvector:pg17` image (a plain `postgres` image will not work — `pgvector` is required).
 
-Vectors and metadata both live in the same Postgres database (`OM_METADATA_BACKEND=postgres`).
+> **Postgres needs a one-time init script (upstream bug).** OpenMemory creates its vector column as an
+> unbounded `vector` and then tries to build an HNSW index on it — which pgvector rejects (`column does
+> not have dimensions`), aborting its own init. The bundled `init/01-openmemory-vectors.sql` pre-creates
+> the vector table at a **fixed dimension (1536)** on a fresh Postgres volume, so OpenMemory's idempotent
+> schema/index creation then succeeds and native pgvector ANN search works. **1536 matches the default
+> `synthetic` embeddings and OpenAI `text-embedding-3` / `ada-002`.** If you use a different embedding
+> dimension, edit that file and reset the volume (`docker compose down -v`).
+
+### API authentication
+
+Protected endpoints (everything except `/health`) require an API key — without `OM_API_KEY` set, the
+server returns **503** (`auth_not_configured`). Send the key as the `x-api-key` header:
+
+```bash
+curl -H "x-api-key: $OM_API_KEY" -H 'content-type: application/json' \
+  -d '{"content":"remember this"}' http://localhost:8080/memory/add
+curl -H "x-api-key: $OM_API_KEY" -H 'content-type: application/json' \
+  -d '{"query":"what should I remember"}' http://localhost:8080/memory/query
+```
+
+For a no-auth deployment on a trusted LAN, drop `OM_API_KEY` and set `OM_DEV_ALLOW_NO_AUTH=true` instead.
 
 ### Dashboard ↔ backend wiring
 
@@ -63,6 +81,8 @@ services:
     image: ghcr.io/lhilton/openmemory:latest
     ports:
       - "8080:8080"
+    environment:
+      OM_API_KEY: ${OM_API_KEY:?set OM_API_KEY}   # still required (or OM_DEV_ALLOW_NO_AUTH=true)
     volumes:
       - openmemory_data:/data
     restart: unless-stopped
@@ -70,8 +90,9 @@ volumes:
   openmemory_data:
 ```
 
-Leave `OM_METADATA_BACKEND` unset (defaults to `sqlite`). Embeddings default to `synthetic`, so it runs
-fully offline with no API keys.
+Leave `OM_METADATA_BACKEND` unset (defaults to `sqlite`) — no Postgres, no init script. Embeddings
+default to `synthetic`, so it needs no embedding-provider keys, but the API still requires `OM_API_KEY`
+(see [API authentication](#api-authentication)).
 
 ## Configuration
 
@@ -84,8 +105,8 @@ Copy `.env.example` to `.env`. Common values:
 | `OM_PG_DB` | `openmemory` | Postgres database |
 | `OM_PORT` | `8080` | Backend host port |
 | `OM_DASHBOARD_PORT` | `3000` | Dashboard host port |
-| `OM_API_KEY` | empty | Optional API key; empty disables auth |
-| `OM_EMBEDDINGS` | `synthetic` | Set `openai` (+ `OPENAI_API_KEY`) for real embeddings |
+| `OM_API_KEY` | — | **Required.** API key sent as `x-api-key`; unset → 503 on protected endpoints |
+| `OM_EMBEDDINGS` | `synthetic` | Set `openai` (+ `OPENAI_API_KEY`) for real embeddings (keep dim 1536) |
 
 The backend accepts many more `OM_*` knobs (rate limiting, decay, reflection, compression, etc.) — see
 upstream [`docker-compose.yml`](https://github.com/CaviraOSS/OpenMemory/blob/main/docker-compose.yml)
