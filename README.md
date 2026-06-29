@@ -94,6 +94,12 @@ Leave `OM_METADATA_BACKEND` unset (defaults to `sqlite`) — no Postgres, no ini
 default to `synthetic`, so it needs no embedding-provider keys, but the API still requires `OM_API_KEY`
 (see [API authentication](#api-authentication)).
 
+## Using an existing Postgres + reverse proxy (Unraid / Compose Manager Plus)
+
+If you already run Postgres and Caddy (or another reverse proxy), the self-contained sample above isn't
+the right fit. See [`examples/`](examples/) for a guide and a compose file that points at an existing
+`postgres18` on a shared network and sits behind an existing Caddy with public TLS.
+
 ## Configuration
 
 Copy `.env.example` to `.env`. Common values:

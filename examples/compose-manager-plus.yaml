@@ -1,0 +1,67 @@
+# =============================================================================
+# OpenMemory for Unraid "Compose Manager Plus" — using an EXISTING Postgres and
+# an EXISTING Caddy. Differs from ../docker-compose.sample.yaml, which bundles its
+# own Postgres + a relative bind-mount (neither of which suits this setup).
+#
+# Assumes:
+#   - A Postgres container `postgres18` (image with pgvector, e.g.
+#     pgvector/pgvector:pg18-trixie) on the external docker network `shared_backend`.
+#   - An existing Caddy on some docker network — set networks.caddy.name below.
+#
+# One-time prep (see examples/README.md):
+#   1. Run examples/postgres-init.sql against postgres18 (creates db/user/extension
+#      + the fixed-dimension vector table the upstream HNSW bug needs).
+#   2. Set networks.caddy.name to your Caddy's docker network.
+#   3. Set OM_PG_PASSWORD + OM_API_KEY in the stack's .env.
+#   4. Add the Caddyfile blocks from examples/README.md and reload Caddy.
+#
+# No host ports are published — Caddy reaches the containers over the docker network.
+# =============================================================================
+services:
+  openmemory:
+    image: ghcr.io/lhilton/openmemory:latest
+    container_name: openmemory
+    environment:
+      OM_PORT: "8080"
+      OM_METADATA_BACKEND: postgres
+      OM_PG_HOST: postgres18                       # your existing Postgres container
+      OM_PG_PORT: "5432"
+      OM_PG_DB: ${OM_PG_DB:-openmemory}
+      OM_PG_USER: ${OM_PG_USER:-openmemory}
+      OM_PG_PASSWORD: ${OM_PG_PASSWORD:?set OM_PG_PASSWORD in the stack .env}
+      OM_PG_SSL: ${OM_PG_SSL:-disable}             # internal docker link; no TLS needed
+      OM_API_KEY: ${OM_API_KEY:?set OM_API_KEY in the stack .env}   # sent as x-api-key
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://localhost:8080/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - shared_backend     # to reach postgres18
+      - caddy              # so Caddy + the dashboard can reach it
+
+  dashboard:
+    image: ghcr.io/lhilton/openmemory-dashboard:latest
+    container_name: openmemory-dashboard
+    environment:
+      OPENMEMORY_API_URL: http://openmemory:8080   # server-side proxy target
+      OPENMEMORY_API_KEY: ${OM_API_KEY:?set OM_API_KEY in the stack .env}
+    depends_on:
+      openmemory:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - caddy
+
+networks:
+  shared_backend:
+    external: true
+  caddy:
+    external: true
+    name: caddy            # <-- CHANGE to the docker network your Caddy runs on
