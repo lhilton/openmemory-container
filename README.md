@@ -98,9 +98,11 @@ docker pull ghcr.io/lhilton/openmemory:latest
 docker pull ghcr.io/lhilton/openmemory-dashboard:latest
 ```
 
-GitHub packages are **private** on first publish. To allow anonymous pulls, make both packages public:
-your GitHub profile → **Packages** → `openmemory` / `openmemory-dashboard` → **Package settings** →
-**Change visibility** → Public. Otherwise authenticate first:
+These packages are **public** (published from a public repo, so GHCR linked them to its visibility) —
+anonymous `docker pull` works with no login. To change visibility later: your GitHub profile →
+**Packages** → `openmemory` / `openmemory-dashboard` → **Package settings** → **Change visibility**.
+
+If a package is ever made private, authenticate before pulling:
 
 ```bash
 echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
