@@ -1,0 +1,92 @@
+# =============================================================================
+# Sample deployment for OpenMemory using the auto-built GHCR images.
+#
+# Default backend is PostgreSQL (pgvector). The OpenMemory backend self-creates
+# its database, the `vector` extension, all tables, and an HNSW index on first
+# boot — there are NO init scripts and NO migration step.
+#
+# Quickstart:
+#   cp .env.example .env        # then set OM_PG_PASSWORD
+#   docker compose -f docker-compose.sample.yaml up -d
+#   curl http://localhost:8080/health      # backend
+#   open  http://localhost:3000            # dashboard
+#
+# For a zero-dependency SQLite deployment instead, see the README ("SQLite mode").
+# =============================================================================
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${OM_PG_USER:-openmemory}
+      POSTGRES_PASSWORD: ${OM_PG_PASSWORD:?Set OM_PG_PASSWORD in .env}
+      POSTGRES_DB: ${OM_PG_DB:-openmemory}
+    volumes:
+      - openmemory_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -U ${OM_PG_USER:-openmemory} -d ${OM_PG_DB:-openmemory}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - openmemory
+
+  openmemory:
+    image: ghcr.io/lhilton/openmemory:latest
+    ports:
+      - "${OM_PORT:-8080}:8080"
+    environment:
+      OM_PORT: "8080"
+      OM_METADATA_BACKEND: postgres        # vectors follow metadata into Postgres
+      OM_PG_HOST: postgres
+      OM_PG_PORT: "5432"
+      OM_PG_DB: ${OM_PG_DB:-openmemory}
+      OM_PG_USER: ${OM_PG_USER:-openmemory}
+      OM_PG_PASSWORD: ${OM_PG_PASSWORD:?Set OM_PG_PASSWORD in .env}
+      OM_PG_SSL: disable
+      OM_API_KEY: ${OM_API_KEY:-}           # empty = no auth (fine for first run)
+      # Embeddings default to 'synthetic' (no external calls, no key needed).
+      # For real embeddings, set OM_EMBEDDINGS=openai and OPENAI_API_KEY in .env.
+    volumes:
+      - openmemory_data:/data               # harmless in PG mode; holds any on-disk state
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://localhost:8080/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - openmemory
+
+  dashboard:
+    image: ghcr.io/lhilton/openmemory-dashboard:latest
+    ports:
+      - "${OM_DASHBOARD_PORT:-3000}:3000"
+    environment:
+      # The dashboard's same-origin proxy forwards browser calls to the backend.
+      # This MUST point at the backend service (the image's built-in default
+      # 127.0.0.1:9432 is wrong for containers).
+      OPENMEMORY_API_URL: http://openmemory:8080
+      OPENMEMORY_API_KEY: ${OM_API_KEY:-}
+    depends_on:
+      openmemory:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - openmemory
+
+volumes:
+  openmemory_pg:
+  openmemory_data:
+
+networks:
+  openmemory:
+    driver: bridge
